@@ -1,0 +1,785 @@
+<#
+Disclaimer
+The sample scripts are not supported under any Microsoft standard support program or service.
+The sample scripts are provided AS IS without warranty of any kind.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+
+Purpose
+Combined Microsoft Graph PowerShell workflow for:
+1. Auditing registered authentication methods.
+2. Removing selected phone authentication methods: alternateMobile and office.
+3. Auditing security questions without attempting removal.
+4. Supporting sample, full tenant, specific UPN, and group object ID scoping.
+5. Supporting dry run, scoped implementation, audit plus remove, and post-removal validation.
+
+Important notes
+- Alternate mobile and office phone are phoneAuthenticationMethod resources and can be removed with Remove-MgUserAuthenticationPhoneMethod.
+- Security questions are inventoried only in this script. Do not represent security question removal as supported unless validated separately against current Microsoft Graph documentation and tenant behavior.
+- A phone method cannot be deleted if it is the user's current default MFA method. Have the user change the default method first, then retry removal.
+- A user cannot have alternateMobile without mobile. This script does not remove mobile phone methods.
+- Recommended operator role: Authentication Administrator or Privileged Authentication Administrator.
+- Required Microsoft Graph permissions for removal: UserAuthenticationMethod.ReadWrite.All. Read-only audit also uses UserAuthenticationMethod.Read.All, User.Read.All, Group.Read.All, AuditLog.Read.All.
+
+Microsoft Documentation
+https://learn.microsoft.com/graph/api/resources/authenticationmethods-overview
+https://learn.microsoft.com/graph/authenticationmethods-get-started
+https://learn.microsoft.com/graph/api/resources/phoneauthenticationmethod
+https://learn.microsoft.com/graph/api/phoneauthenticationmethod-delete
+https://learn.microsoft.com/powershell/module/microsoft.graph.identity.signins/remove-mguserauthenticationphonemethod
+#>
+
+param(
+    [string]$OutputFolder = 'C:\Temp\AuthMethodAuditRemoval'
+)
+
+# =========================
+# MODULES
+# =========================
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+Import-Module Microsoft.Graph.Users -ErrorAction Stop
+Import-Module Microsoft.Graph.Groups -ErrorAction Stop
+Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction Stop
+Import-Module Microsoft.Graph.Reports -ErrorAction Stop
+
+$script:UseExcel = $false
+try {
+    if (Get-Module -ListAvailable -Name ImportExcel) {
+        Import-Module ImportExcel -ErrorAction Stop
+        $script:UseExcel = $true
+    }
+}
+catch {
+    $script:UseExcel = $false
+}
+
+# =========================
+# CONSTANTS
+# =========================
+$script:PhoneTypeMap = @{
+    '3179e48a-750b-4051-897c-87b9720928f7' = 'mobile'
+    'b6332ec1-7057-4abe-9331-3d72feddfe41' = 'alternateMobile'
+    'e37fc753-ff3b-4958-9484-eaa9425c82bc' = 'office'
+}
+
+$script:ReadablePhoneType = @{
+    'mobile'          = 'Mobile phone'
+    'alternateMobile' = 'Alternate mobile phone'
+    'office'          = 'Office phone'
+}
+
+$script:LastRemovalScope = @()
+$script:LastRemovalResults = @()
+
+# =========================
+# GENERAL HELPERS
+# =========================
+function Initialize-OutputFolder {
+    if (-not (Test-Path $OutputFolder)) {
+        New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Export-ResultSet {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Results,
+        [Parameter(Mandatory = $true)][string]$BaseName
+    )
+
+    Initialize-OutputFolder
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $safeName = $BaseName -replace '[^A-Za-z0-9_\-]', ''
+
+    if (@($Results).Count -eq 0) {
+        Write-Host 'No results to export.' -ForegroundColor Yellow
+        return
+    }
+
+    if ($script:UseExcel) {
+        $xlsxPath = Join-Path $OutputFolder "$safeName`_$timestamp.xlsx"
+        $Results | Export-Excel -Path $xlsxPath -WorksheetName 'Results' -TableName $safeName -TableStyle Medium6 -AutoSize -FreezeTopRow -BoldTopRow
+        Write-Host "Exported Excel: $xlsxPath" -ForegroundColor Green
+    }
+    else {
+        $csvPath = Join-Path $OutputFolder "$safeName`_$timestamp.csv"
+        $Results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+        Write-Host "Exported CSV: $csvPath" -ForegroundColor Green
+    }
+
+    $txtPath = Join-Path $OutputFolder "$safeName`_$timestamp.txt"
+    $Results | Format-List * | Out-String -Width 4096 | Set-Content -Path $txtPath -Encoding UTF8
+    Write-Host "Exported text: $txtPath" -ForegroundColor Green
+}
+
+function Disconnect-GraphSession {
+    try {
+        if (Get-MgContext) {
+            Disconnect-MgGraph | Out-Null
+            Write-Host 'Disconnected from Microsoft Graph.' -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host 'Disconnect attempt completed.' -ForegroundColor Yellow
+    }
+}
+
+function Connect-GraphSession {
+    Disconnect-GraphSession
+    Write-Host 'Connecting to Microsoft Graph...' -ForegroundColor Cyan
+    Connect-MgGraph -NoWelcome -Scopes @(
+        'User.Read.All',
+        'Group.Read.All',
+        'AuditLog.Read.All',
+        'UserAuthenticationMethod.Read.All',
+        'UserAuthenticationMethod.ReadWrite.All'
+    ) | Out-Null
+
+    $ctx = Get-MgContext
+    if ($ctx) {
+        Write-Host "Connected as $($ctx.Account)." -ForegroundColor Green
+        Write-Host "Tenant: $($ctx.TenantId)" -ForegroundColor DarkCyan
+    }
+    else {
+        Write-Host 'Connection did not complete.' -ForegroundColor Red
+    }
+}
+
+function Test-GraphConnection {
+    if (-not (Get-MgContext)) {
+        Write-Host 'Not connected. Use option 1 to connect to Microsoft Graph first.' -ForegroundColor Red
+        return $false
+    }
+    return $true
+}
+
+function Read-RequiredValue {
+    param([Parameter(Mandatory = $true)][string]$Prompt)
+    while ($true) {
+        $value = Read-Host $Prompt
+        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+        Write-Host 'A value is required.' -ForegroundColor Red
+    }
+}
+
+function Get-AccountScope {
+    while ($true) {
+        Write-Host ''
+        Write-Host 'Account scope' -ForegroundColor Cyan
+        Write-Host '1. Enabled accounts only'
+        Write-Host '2. All accounts'
+        $choice = Read-Host 'Select account scope'
+        switch ($choice) {
+            '1' { return 'Enabled' }
+            '2' { return 'All' }
+            default { Write-Host 'Invalid selection.' -ForegroundColor Red }
+        }
+    }
+}
+
+function Get-DomainFilter {
+    Write-Host ''
+    Write-Host 'Optional UPN domain filter. Use * for all domains.' -ForegroundColor Cyan
+    $value = Read-Host 'Example: contoso.com,fabrikam.com'
+    if ([string]::IsNullOrWhiteSpace($value) -or $value.Trim() -eq '*') { return @() }
+    return @($value.Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Get-UpnFilter {
+    $value = Read-RequiredValue -Prompt 'Enter one or more UPNs separated by commas'
+    return @($value.Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Get-GroupObjectIdFilter {
+    $value = Read-RequiredValue -Prompt 'Enter one or more group object IDs separated by commas'
+    return @($value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Get-SampleSize {
+    while ($true) {
+        $value = Read-Host 'Enter sample size'
+        $parsed = 0
+        if ([int]::TryParse($value, [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+        Write-Host 'Enter a whole number greater than 0.' -ForegroundColor Red
+    }
+}
+
+function Get-RunScope {
+    while ($true) {
+        Write-Host ''
+        Write-Host 'Target scope' -ForegroundColor Cyan
+        Write-Host '1. Sample users'
+        Write-Host '2. Full tenant'
+        Write-Host '3. Specific UPN(s)'
+        Write-Host '4. Specific group object ID(s)'
+        Write-Host 'B. Back'
+        $choice = Read-Host 'Select target scope'
+
+        switch ($choice.ToUpper()) {
+            '1' {
+                return [PSCustomObject]@{
+                    Mode = 'Sample'
+                    AccountScope = Get-AccountScope
+                    SampleSize = Get-SampleSize
+                    DomainFilter = Get-DomainFilter
+                    UpnFilter = @()
+                    GroupObjectIdFilter = @()
+                }
+            }
+            '2' {
+                return [PSCustomObject]@{
+                    Mode = 'Full'
+                    AccountScope = Get-AccountScope
+                    SampleSize = 0
+                    DomainFilter = Get-DomainFilter
+                    UpnFilter = @()
+                    GroupObjectIdFilter = @()
+                }
+            }
+            '3' {
+                return [PSCustomObject]@{
+                    Mode = 'TargetedUPN'
+                    AccountScope = Get-AccountScope
+                    SampleSize = 0
+                    DomainFilter = @()
+                    UpnFilter = Get-UpnFilter
+                    GroupObjectIdFilter = @()
+                }
+            }
+            '4' {
+                return [PSCustomObject]@{
+                    Mode = 'GroupObjectId'
+                    AccountScope = Get-AccountScope
+                    SampleSize = 0
+                    DomainFilter = @()
+                    UpnFilter = @()
+                    GroupObjectIdFilter = Get-GroupObjectIdFilter
+                }
+            }
+            'B' { return $null }
+            default { Write-Host 'Invalid selection.' -ForegroundColor Red }
+        }
+    }
+}
+
+# =========================
+# TARGET USER RESOLUTION
+# =========================
+function Get-TargetedUsersByUpn {
+    param([string[]]$UpnFilter)
+    $users = [System.Collections.Generic.List[object]]::new()
+    foreach ($upn in @($UpnFilter)) {
+        try {
+            $u = Get-MgUser -UserId $upn -Property Id,DisplayName,UserPrincipalName,Mail,AccountEnabled,LastPasswordChangeDateTime -ErrorAction Stop
+            if ($u) { $users.Add($u) }
+        }
+        catch {
+            Write-Host "Unable to find user $upn : $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    return @($users)
+}
+
+function Get-TargetedGroupUsers {
+    param([string[]]$GroupObjectIds)
+    $usersById = @{}
+    $processedGroups = @{}
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+
+    foreach ($groupId in @($GroupObjectIds)) {
+        if (-not [string]::IsNullOrWhiteSpace($groupId)) { $queue.Enqueue($groupId.Trim()) }
+    }
+
+    while ($queue.Count -gt 0) {
+        $groupId = $queue.Dequeue()
+        if ($processedGroups.ContainsKey($groupId)) { continue }
+        $processedGroups[$groupId] = $true
+
+        try {
+            $group = Get-MgGroup -GroupId $groupId -Property Id,DisplayName -ErrorAction Stop
+            Write-Host "Reading group: $($group.DisplayName) [$($group.Id)]" -ForegroundColor DarkCyan
+            $members = @(Get-MgGroupMember -GroupId $group.Id -All -ErrorAction Stop)
+
+            foreach ($member in @($members)) {
+                $odataType = $null
+                if ($member.PSObject.Properties.Name -contains 'AdditionalProperties' -and $member.AdditionalProperties.ContainsKey('@odata.type')) {
+                    $odataType = [string]$member.AdditionalProperties['@odata.type']
+                }
+
+                if ($odataType -eq '#microsoft.graph.group') {
+                    if (-not $processedGroups.ContainsKey($member.Id)) { $queue.Enqueue($member.Id) }
+                }
+                elseif ($odataType -eq '#microsoft.graph.user' -or [string]::IsNullOrWhiteSpace($odataType)) {
+                    try {
+                        $u = Get-MgUser -UserId $member.Id -Property Id,DisplayName,UserPrincipalName,Mail,AccountEnabled,LastPasswordChangeDateTime -ErrorAction Stop
+                        if ($u -and -not $usersById.ContainsKey($u.Id)) { $usersById[$u.Id] = $u }
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch {
+            Write-Host "Unable to process group $groupId : $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    return @($usersById.Values)
+}
+
+function Get-UsersForScope {
+    param([Parameter(Mandatory = $true)]$Scope)
+
+    if ($Scope.Mode -eq 'TargetedUPN') {
+        $users = @(Get-TargetedUsersByUpn -UpnFilter $Scope.UpnFilter)
+    }
+    elseif ($Scope.Mode -eq 'GroupObjectId') {
+        $users = @(Get-TargetedGroupUsers -GroupObjectIds $Scope.GroupObjectIdFilter)
+    }
+    else {
+        Write-Host 'Retrieving users from tenant...' -ForegroundColor Cyan
+        $users = @(Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,Mail,AccountEnabled,LastPasswordChangeDateTime -ErrorAction Stop)
+
+        if (@($Scope.DomainFilter).Count -gt 0) {
+            $users = @($users | Where-Object {
+                $_.UserPrincipalName -match '@' -and ($_.UserPrincipalName.Split('@')[-1]).ToLowerInvariant() -in $Scope.DomainFilter
+            })
+        }
+    }
+
+    if ($Scope.AccountScope -eq 'Enabled') {
+        $users = @($users | Where-Object { $_.AccountEnabled -eq $true })
+    }
+
+    if ($Scope.Mode -eq 'Sample') {
+        $users = @($users | Select-Object -First $Scope.SampleSize)
+    }
+
+    return @($users | Sort-Object UserPrincipalName)
+}
+
+# =========================
+# AUTH METHOD INVENTORY
+# =========================
+function Get-PhoneTypeFromMethod {
+    param($PhoneMethod)
+
+    if ($null -eq $PhoneMethod) { return 'Unknown' }
+    if ($PhoneMethod.PSObject.Properties.Name -contains 'PhoneType' -and $null -ne $PhoneMethod.PhoneType) { return [string]$PhoneMethod.PhoneType }
+    if ($PhoneMethod.PSObject.Properties.Name -contains 'AdditionalProperties' -and $PhoneMethod.AdditionalProperties.ContainsKey('phoneType')) { return [string]$PhoneMethod.AdditionalProperties['phoneType'] }
+    if ($script:PhoneTypeMap.ContainsKey([string]$PhoneMethod.Id)) { return $script:PhoneTypeMap[[string]$PhoneMethod.Id] }
+    return 'Unknown'
+}
+
+function Get-UserPhoneMethodsSafe {
+    param([Parameter(Mandatory = $true)][string]$UserId)
+    try { return @(Get-MgUserAuthenticationPhoneMethod -UserId $UserId -ErrorAction Stop) }
+    catch { return @() }
+}
+
+function Get-RegistrationDetailsSafe {
+    param([Parameter(Mandatory = $true)][string]$UserId)
+    try {
+        return Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/reports/authenticationMethods/userRegistrationDetails/$UserId" -OutputType PSObject -ErrorAction Stop
+    }
+    catch { return $null }
+}
+
+function Get-RegistrationMethodsFromReport {
+    param($RegistrationDetails)
+    if ($null -eq $RegistrationDetails) { return @() }
+    if ($RegistrationDetails.PSObject.Properties.Name -contains 'methodsRegistered' -and $null -ne $RegistrationDetails.methodsRegistered) { return @($RegistrationDetails.methodsRegistered) }
+    if ($RegistrationDetails.PSObject.Properties.Name -contains 'MethodsRegistered' -and $null -ne $RegistrationDetails.MethodsRegistered) { return @($RegistrationDetails.MethodsRegistered) }
+    return @()
+}
+
+function Get-UserSignInPreferenceSafe {
+    param([Parameter(Mandatory = $true)][string]$UserId)
+    $result = [PSCustomObject]@{
+        SignInMode = 'Unavailable'
+        UserPreferredMethodForSecondaryAuthentication = 'Unavailable'
+        SystemPreferredEnabled = $null
+    }
+
+    try {
+        $prefs = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/users/$UserId/authentication/signInPreferences" -OutputType PSObject -ErrorAction Stop
+        if ($prefs.PSObject.Properties.Name -contains 'isSystemPreferredAuthenticationMethodEnabled') {
+            $result.SystemPreferredEnabled = [bool]$prefs.isSystemPreferredAuthenticationMethodEnabled
+            $result.SignInMode = if ($result.SystemPreferredEnabled) { 'SystemPreferred' } else { 'UserPreferred' }
+        }
+        if ($prefs.PSObject.Properties.Name -contains 'userPreferredMethodForSecondaryAuthentication' -and $null -ne $prefs.userPreferredMethodForSecondaryAuthentication) {
+            $result.UserPreferredMethodForSecondaryAuthentication = [string]$prefs.userPreferredMethodForSecondaryAuthentication
+        }
+    }
+    catch { }
+
+    return $result
+}
+
+function Get-UserAuthInventory {
+    param([Parameter(Mandatory = $true)]$User)
+
+    $phoneMethods = @(Get-UserPhoneMethodsSafe -UserId $User.Id)
+    $methodNames = [System.Collections.Generic.List[string]]::new()
+    $phoneTypes = [System.Collections.Generic.List[string]]::new()
+    $phoneNumbers = [System.Collections.Generic.List[string]]::new()
+
+    $hasMobile = $false
+    $hasAlternateMobile = $false
+    $hasOfficePhone = $false
+    $hasSecurityQuestions = $false
+
+    foreach ($phone in @($phoneMethods)) {
+        $type = Get-PhoneTypeFromMethod -PhoneMethod $phone
+        $phoneTypes.Add($type)
+        switch ($type) {
+            'mobile' { $hasMobile = $true; $methodNames.Add('Phone call / SMS (mobile)') }
+            'alternateMobile' { $hasAlternateMobile = $true; $methodNames.Add('Phone call (alternate mobile)') }
+            'office' { $hasOfficePhone = $true; $methodNames.Add('Phone call (office)') }
+            default { $methodNames.Add('Phone') }
+        }
+        if ($phone.PSObject.Properties.Name -contains 'PhoneNumber' -and -not [string]::IsNullOrWhiteSpace([string]$phone.PhoneNumber)) {
+            $phoneNumbers.Add([string]$phone.PhoneNumber)
+        }
+    }
+
+    try {
+        $methods = @(Get-MgUserAuthenticationMethod -UserId $User.Id -ErrorAction Stop)
+        foreach ($method in @($methods)) {
+            $odataType = $null
+            if ($method.PSObject.Properties.Name -contains 'AdditionalProperties' -and $method.AdditionalProperties.ContainsKey('@odata.type')) { $odataType = [string]$method.AdditionalProperties['@odata.type'] }
+            switch ($odataType) {
+                '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod' { $methodNames.Add('Microsoft Authenticator') }
+                '#microsoft.graph.passwordlessMicrosoftAuthenticatorAuthenticationMethod' { $methodNames.Add('Authenticator passwordless') }
+                '#microsoft.graph.fido2AuthenticationMethod' { $methodNames.Add('FIDO2 security key') }
+                '#microsoft.graph.hardwareOathAuthenticationMethod' { $methodNames.Add('Hardware OATH token') }
+                '#microsoft.graph.softwareOathAuthenticationMethod' { $methodNames.Add('Software OATH token') }
+                '#microsoft.graph.emailAuthenticationMethod' { $methodNames.Add('Email') }
+                '#microsoft.graph.temporaryAccessPassAuthenticationMethod' { $methodNames.Add('Temporary Access Pass') }
+                '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod' { $methodNames.Add('Windows Hello for Business') }
+                '#microsoft.graph.platformCredentialAuthenticationMethod' { $methodNames.Add('Passkey platform credential') }
+                '#microsoft.graph.securityQuestionAuthenticationMethod' { $methodNames.Add('Security questions'); $hasSecurityQuestions = $true }
+            }
+        }
+    }
+    catch { }
+
+    $registrationDetails = Get-RegistrationDetailsSafe -UserId $User.Id
+    foreach ($registeredMethod in @(Get-RegistrationMethodsFromReport -RegistrationDetails $registrationDetails)) {
+        if ([string]$registeredMethod -match 'security' -or [string]$registeredMethod -match 'question') {
+            $hasSecurityQuestions = $true
+            $methodNames.Add('Security questions')
+        }
+    }
+
+    $signInPreference = Get-UserSignInPreferenceSafe -UserId $User.Id
+
+    return [PSCustomObject]@{
+        UserPrincipalName = $User.UserPrincipalName
+        DisplayName = $User.DisplayName
+        UserId = $User.Id
+        Mail = $User.Mail
+        AccountEnabled = $User.AccountEnabled
+        Domain = $(if ($User.UserPrincipalName -match '@') { $User.UserPrincipalName.Split('@')[-1] } else { '' })
+        LastPasswordChangeDateTime = $User.LastPasswordChangeDateTime
+        AllRegisteredAuthMethods = $(if ($methodNames.Count -gt 0) { ($methodNames | Sort-Object -Unique) -join '; ' } else { 'None detected' })
+        PhoneTypes = $(if ($phoneTypes.Count -gt 0) { ($phoneTypes | Sort-Object -Unique) -join '; ' } else { 'None' })
+        PhoneNumbers = $(if ($phoneNumbers.Count -gt 0) { ($phoneNumbers | Sort-Object -Unique) -join '; ' } else { '' })
+        HasMobile = $hasMobile
+        HasAlternateMobile = $hasAlternateMobile
+        HasOfficePhone = $hasOfficePhone
+        SecurityQuestionsRegistered = $hasSecurityQuestions
+        SignInMode = $signInPreference.SignInMode
+        UserPreferredMethodForSecondaryAuthentication = $signInPreference.UserPreferredMethodForSecondaryAuthentication
+        SystemPreferredEnabled = $signInPreference.SystemPreferredEnabled
+    }
+}
+
+# =========================
+# AUDIT WORKFLOW
+# =========================
+function Invoke-AuthMethodAuditForUsers {
+    param([Parameter(Mandatory = $true)][object[]]$Users)
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $total = @($Users).Count
+    $counter = 0
+
+    foreach ($user in @($Users)) {
+        $counter++
+        Write-Progress -Activity 'Auditing authentication methods' -Status "$counter of $total : $($user.UserPrincipalName)" -PercentComplete (($counter / $total) * 100)
+        try {
+            $results.Add((Get-UserAuthInventory -User $user))
+        }
+        catch {
+            $results.Add([PSCustomObject]@{
+                UserPrincipalName = $user.UserPrincipalName
+                DisplayName = $user.DisplayName
+                UserId = $user.Id
+                Error = $_.Exception.Message
+            })
+        }
+    }
+
+    Write-Progress -Activity 'Auditing authentication methods' -Completed
+    return @($results | Sort-Object UserPrincipalName)
+}
+
+function Start-AuditWorkflow {
+    if (-not (Test-GraphConnection)) { return }
+    $scope = Get-RunScope
+    if ($null -eq $scope) { return }
+
+    $users = @(Get-UsersForScope -Scope $scope)
+    if (@($users).Count -eq 0) {
+        Write-Host 'No users found for the selected scope.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Users in scope: $(@($users).Count)" -ForegroundColor Cyan
+    $results = @(Invoke-AuthMethodAuditForUsers -Users $users)
+    Export-ResultSet -Results $results -BaseName 'AuthMethods_Audit'
+}
+
+# =========================
+# REMOVAL WORKFLOW
+# =========================
+function Get-RemovalSelection {
+    while ($true) {
+        Write-Host ''
+        Write-Host 'Removal target selection' -ForegroundColor Cyan
+        Write-Host '1. Alternate mobile only'
+        Write-Host '2. Office phone only'
+        Write-Host '3. Alternate mobile and office phone'
+        Write-Host '4. Security questions inventory only no removal'
+        Write-Host '5. Custom selection'
+        Write-Host 'B. Back'
+        $choice = Read-Host 'Select removal target'
+
+        switch ($choice.ToUpper()) {
+            '1' { return [PSCustomObject]@{ PhoneTypes = @('alternateMobile'); SecurityQuestionInventoryOnly = $false } }
+            '2' { return [PSCustomObject]@{ PhoneTypes = @('office'); SecurityQuestionInventoryOnly = $false } }
+            '3' { return [PSCustomObject]@{ PhoneTypes = @('alternateMobile','office'); SecurityQuestionInventoryOnly = $false } }
+            '4' { return [PSCustomObject]@{ PhoneTypes = @(); SecurityQuestionInventoryOnly = $true } }
+            '5' {
+                Write-Host 'Valid values: alternateMobile, office, securityQuestionsInventoryOnly' -ForegroundColor DarkCyan
+                $raw = Read-RequiredValue -Prompt 'Enter custom values separated by commas'
+                $values = @($raw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                $phoneTargets = @($values | Where-Object { $_ -in @('alternateMobile','office') } | Sort-Object -Unique)
+                $sqOnly = @($values | Where-Object { $_ -eq 'securityQuestionsInventoryOnly' }).Count -gt 0
+                if (@($phoneTargets).Count -eq 0 -and -not $sqOnly) {
+                    Write-Host 'No valid custom selection provided.' -ForegroundColor Red
+                }
+                else {
+                    return [PSCustomObject]@{ PhoneTypes = $phoneTargets; SecurityQuestionInventoryOnly = $sqOnly }
+                }
+            }
+            'B' { return $null }
+            default { Write-Host 'Invalid selection.' -ForegroundColor Red }
+        }
+    }
+}
+
+function Test-RemovalConfirmation {
+    param(
+        [Parameter(Mandatory = $true)][int]$UserCount,
+        [Parameter(Mandatory = $true)][string[]]$PhoneTypes,
+        [switch]$DryRun
+    )
+
+    if ($DryRun) { return $true }
+
+    Write-Host ''
+    Write-Host 'CONFIRMATION REQUIRED' -ForegroundColor Yellow
+    Write-Host "Users in scope: $UserCount" -ForegroundColor Yellow
+    Write-Host "Phone method types selected for removal: $($PhoneTypes -join ', ')" -ForegroundColor Yellow
+    Write-Host 'Type REMOVE to proceed. Any other value cancels.' -ForegroundColor Yellow
+    $confirm = Read-Host 'Confirmation'
+    return ($confirm -eq 'REMOVE')
+}
+
+function Invoke-PhoneMethodRemovalForUsers {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Users,
+        [Parameter(Mandatory = $true)][string[]]$PhoneTypes,
+        [switch]$DryRun
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $total = @($Users).Count
+    $counter = 0
+
+    foreach ($user in @($Users)) {
+        $counter++
+        Write-Progress -Activity 'Removing selected phone methods' -Status "$counter of $total : $($user.UserPrincipalName)" -PercentComplete (($counter / $total) * 100)
+
+        $phoneMethods = @(Get-UserPhoneMethodsSafe -UserId $user.Id)
+        $targetMethods = @($phoneMethods | Where-Object { (Get-PhoneTypeFromMethod -PhoneMethod $_) -in $PhoneTypes })
+
+        if (@($targetMethods).Count -eq 0) {
+            $results.Add([PSCustomObject]@{
+                UserPrincipalName = $user.UserPrincipalName
+                DisplayName = $user.DisplayName
+                UserId = $user.Id
+                PhoneType = ''
+                PhoneMethodId = ''
+                Action = 'None'
+                Result = 'No selected phone method found'
+                Error = ''
+            })
+            continue
+        }
+
+        foreach ($method in @($targetMethods)) {
+            $phoneType = Get-PhoneTypeFromMethod -PhoneMethod $method
+            if ($DryRun) {
+                $results.Add([PSCustomObject]@{
+                    UserPrincipalName = $user.UserPrincipalName
+                    DisplayName = $user.DisplayName
+                    UserId = $user.Id
+                    PhoneType = $phoneType
+                    PhoneMethodId = $method.Id
+                    Action = 'DryRun'
+                    Result = 'Would remove'
+                    Error = ''
+                })
+                continue
+            }
+
+            try {
+                Remove-MgUserAuthenticationPhoneMethod -UserId $user.Id -PhoneAuthenticationMethodId $method.Id -Confirm:$false -ErrorAction Stop
+                $results.Add([PSCustomObject]@{
+                    UserPrincipalName = $user.UserPrincipalName
+                    DisplayName = $user.DisplayName
+                    UserId = $user.Id
+                    PhoneType = $phoneType
+                    PhoneMethodId = $method.Id
+                    Action = 'Remove'
+                    Result = 'Removed'
+                    Error = ''
+                })
+            }
+            catch {
+                $results.Add([PSCustomObject]@{
+                    UserPrincipalName = $user.UserPrincipalName
+                    DisplayName = $user.DisplayName
+                    UserId = $user.Id
+                    PhoneType = $phoneType
+                    PhoneMethodId = $method.Id
+                    Action = 'Remove'
+                    Result = 'Failed'
+                    Error = $_.Exception.Message
+                })
+            }
+        }
+    }
+
+    Write-Progress -Activity 'Removing selected phone methods' -Completed
+    return @($results | Sort-Object UserPrincipalName,PhoneType)
+}
+
+function Start-RemovalWorkflow {
+    param([switch]$AuditFirst)
+
+    if (-not (Test-GraphConnection)) { return }
+
+    $scope = Get-RunScope
+    if ($null -eq $scope) { return }
+
+    $selection = Get-RemovalSelection
+    if ($null -eq $selection) { return }
+
+    $users = @(Get-UsersForScope -Scope $scope)
+    if (@($users).Count -eq 0) {
+        Write-Host 'No users found for the selected scope.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Users in scope: $(@($users).Count)" -ForegroundColor Cyan
+
+    if ($AuditFirst) {
+        $auditResults = @(Invoke-AuthMethodAuditForUsers -Users $users)
+        Export-ResultSet -Results $auditResults -BaseName 'AuthMethods_PreRemovalAudit'
+    }
+
+    if ($selection.SecurityQuestionInventoryOnly) {
+        $sqResults = @(Invoke-AuthMethodAuditForUsers -Users $users | Where-Object { $_.SecurityQuestionsRegistered -eq $true })
+        Export-ResultSet -Results $sqResults -BaseName 'SecurityQuestions_InventoryOnly'
+        Write-Host 'Security questions were inventoried only. No security question removal was attempted.' -ForegroundColor Yellow
+    }
+
+    if (@($selection.PhoneTypes).Count -eq 0) { return }
+
+    $dryRunChoice = Read-Host 'Run as dry run first? Y or N'
+    $dryRun = $dryRunChoice -notin @('N','n','No','no')
+
+    if (-not (Test-RemovalConfirmation -UserCount @($users).Count -PhoneTypes $selection.PhoneTypes -DryRun:$dryRun)) {
+        Write-Host 'Removal cancelled.' -ForegroundColor Yellow
+        return
+    }
+
+    $removalResults = @(Invoke-PhoneMethodRemovalForUsers -Users $users -PhoneTypes $selection.PhoneTypes -DryRun:$dryRun)
+    $script:LastRemovalScope = @($users)
+    $script:LastRemovalResults = @($removalResults)
+    Export-ResultSet -Results $removalResults -BaseName $(if ($dryRun) { 'AuthMethods_Removal_DryRun' } else { 'AuthMethods_Removal_Results' })
+
+    if (-not $dryRun) {
+        $validateChoice = Read-Host 'Run post-removal validation now? Y or N'
+        if ($validateChoice -in @('Y','y','Yes','yes')) {
+            $validation = @(Invoke-AuthMethodAuditForUsers -Users $users)
+            Export-ResultSet -Results $validation -BaseName 'AuthMethods_PostRemovalValidation'
+        }
+    }
+}
+
+function Start-ValidationWorkflow {
+    if (-not (Test-GraphConnection)) { return }
+
+    if (@($script:LastRemovalScope).Count -gt 0) {
+        $useLast = Read-Host 'Use last removal scope? Y or N'
+        if ($useLast -in @('Y','y','Yes','yes')) {
+            $validation = @(Invoke-AuthMethodAuditForUsers -Users $script:LastRemovalScope)
+            Export-ResultSet -Results $validation -BaseName 'AuthMethods_PostRemovalValidation'
+            return
+        }
+    }
+
+    $scope = Get-RunScope
+    if ($null -eq $scope) { return }
+    $users = @(Get-UsersForScope -Scope $scope)
+    if (@($users).Count -eq 0) {
+        Write-Host 'No users found for the selected scope.' -ForegroundColor Yellow
+        return
+    }
+
+    $validationResults = @(Invoke-AuthMethodAuditForUsers -Users $users)
+    Export-ResultSet -Results $validationResults -BaseName 'AuthMethods_Validation'
+}
+
+# =========================
+# MAIN MENU
+# =========================
+:mainLoop while ($true) {
+    Write-Host ''
+    Write-Host '===== AUTH METHODS AUDIT AND REMOVAL MENU =====' -ForegroundColor Cyan
+    Write-Host '1. Disconnect / Reconnect Microsoft Graph'
+    Write-Host '2. Audit authentication methods'
+    Write-Host '3. Remove targeted authentication phone methods'
+    Write-Host '4. Audit plus remove targeted authentication phone methods'
+    Write-Host '5. Validate removal results'
+    Write-Host 'Q. Quit'
+
+    $choice = Read-Host 'Select an option'
+
+    switch ($choice.ToUpper()) {
+        '1' { Connect-GraphSession }
+        '2' { Start-AuditWorkflow }
+        '3' { Start-RemovalWorkflow }
+        '4' { Start-RemovalWorkflow -AuditFirst }
+        '5' { Start-ValidationWorkflow }
+        'Q' {
+            Disconnect-GraphSession
+            Write-Host 'Exiting...' -ForegroundColor Yellow
+            break mainLoop
+        }
+        default { Write-Host 'Invalid selection.' -ForegroundColor Red }
+    }
+}
+
